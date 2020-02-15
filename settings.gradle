@@ -1,0 +1,2 @@
+rootProject.name='CameraX Face Check In'
+include ':app'
