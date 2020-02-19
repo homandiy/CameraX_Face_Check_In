@@ -3,28 +3,36 @@ package com.homan.huang.cameraxfacecheckin
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.content.res.Configuration
+import android.graphics.Color
 import android.graphics.Matrix
+import android.hardware.SensorManager
+import android.hardware.display.DisplayManager
 import androidx.appcompat.app.AppCompatActivity
 import android.os.Bundle
 import android.util.DisplayMetrics
 import android.util.Log
 import android.util.Rational
 import android.util.Size
-import android.view.Surface
-import android.view.TextureView
-import android.view.ViewGroup
+import android.view.*
 import android.widget.Button
 import android.widget.Toast
 import androidx.camera.core.AspectRatio
 
 import androidx.camera.core.AspectRatio.*
+import androidx.camera.core.Camera
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.CameraSelector.LENS_FACING_BACK
+import androidx.camera.core.CameraSelector.LENS_FACING_FRONT
 
-import androidx.camera.core.CameraX
 import androidx.camera.core.Preview
-import androidx.camera.core.PreviewConfig
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
+import com.google.common.util.concurrent.ListenableFuture
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
@@ -47,12 +55,34 @@ private val REQUIRED_PERMISSIONS = arrayOf(
 
 class MainActivity : AppCompatActivity(), LifecycleOwner {
 
+    private lateinit var cameraProviderFuture : ListenableFuture<ProcessCameraProvider>
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+        cameraProviderFuture = ProcessCameraProvider.getInstance(this)
 
-        viewFinder = findViewById(R.id.view_finder)
-        captureButton = findViewById(R.id.capture_Button)
+        val mOrientationEventListener =  object : OrientationEventListener(this) {
+            override fun onOrientationChanged(orientation: Int) {
+                // Monitors orientation values to determine the target rotation value
+                val rotation = if (orientation >= 45 && orientation < 135) {
+                    Surface.ROTATION_270
+                } else if (orientation >= 135 && orientation < 225) {
+                    Surface.ROTATION_180
+                } else if (orientation >= 225 && orientation < 315) {
+                    Surface.ROTATION_90
+                } else {
+                    Surface.ROTATION_0
+                }
+
+                //imageCapture?.setTargetRotation(rotation)
+            }
+        }
+        if (mOrientationEventListener.canDetectOrientation()) {
+            mOrientationEventListener.enable();
+        } else {
+            mOrientationEventListener.disable();
+        }
 
         // Request camera permissions
         if (allPermissionsGranted()) {
@@ -62,50 +92,91 @@ class MainActivity : AppCompatActivity(), LifecycleOwner {
                 this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
         }
 
-        // Every time the provided texture view changes, recompute layout
-        viewFinder.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
-            updateRotation()
-        }
     }
 
     // Add this after onCreate
     private val executor = Executors.newSingleThreadExecutor()
-    private lateinit var viewFinder: TextureView
-    private lateinit var captureButton: Button
+
+    private val viewFinder by lazy { findViewById<PreviewView>(R.id.view_finder) }
+    private val captureButton by lazy { findViewById<Button>(R.id.capture_Button) }
+
+    private var camera: Camera? = null
+    private var rotation: Int = 0
 
     // Camera Hardware and Use Cases
     private fun startCamera() {
-        setScreenRatio()
+        //setScreenRatio()
 
-        // Create configuration object for the viewfinder use case
-        val previewConfig = PreviewConfig.Builder().apply {
-            setTargetAspectRatio(screenAspectRatio)
-        }.build()
+        val cameraSelector = CameraSelector.Builder()
+            .requireLensFacing(LENS_FACING_BACK).build()
 
+        // Bind the CameraProvider to the LifeCycleOwner
+        cameraProviderFuture.addListener(Runnable {
+            // CameraProvider
+            val cameraProvider = cameraProviderFuture.get()
 
-        // Build the viewfinder use case
-        val preview = Preview(previewConfig)
+            // Preview
+            val preview = setPreview()
 
-        // Every time the viewfinder is updated, recompute layout
-        preview.setOnPreviewOutputUpdateListener {
+            // Must unbind the use-cases before rebinding them.
+            cameraProvider.unbindAll()
 
-            // To update the SurfaceTexture, we have to remove it and re-add it
-            val parent = viewFinder.parent as ViewGroup
-            parent.removeView(viewFinder)
-            parent.addView(viewFinder, 0)
+            try {
+                // A variable number of use-cases can be passed here -
+                // camera provides access to CameraControl & CameraInfo
+                camera = cameraProvider.bindToLifecycle(
+                    this as LifecycleOwner, cameraSelector, preview)
+            } catch(exc: Exception) {
+                lge("Use case binding failed: $exc")
+            }
 
-            viewFinder.surfaceTexture = it.surfaceTexture
-            updateRotation()
-        }
-
-        // Bind use cases to lifecycle
-        // If Android Studio complains about "this" being not a LifecycleOwner
-        // try rebuilding the project or updating the appcompat dependency to
-        // version 1.1.0 or higher.
-        CameraX.bindToLifecycle(this, preview)
+        }, ContextCompat.getMainExecutor(this))
     }
 
-    private lateinit var screenAspectRatio: AspectRatio
+    private fun setPreview(): Preview {
+
+        val previewWidth = viewFinder.getWidth()
+        val previewHeight =  viewFinder.getHeight()
+        rotation = viewFinder.display.rotation
+
+        //size of the screen
+        val screen = Size(previewWidth, previewHeight)
+
+        // Create configuration object for the previewView use case
+        // Remove builder from PreviewConfig
+        val preview: Preview = Preview.Builder().apply {
+            setTargetResolution(screen)
+            setTargetName("Preview")
+            setTargetRotation(rotation)
+        }.build()
+
+        // Every time the previewView is updated, recompute layout
+        preview.setSurfaceProvider(viewFinder.previewSurfaceProvider)
+
+        return preview
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        updateCameraUi()
+    }
+
+    /**
+     * We need a display listener for orientation changes that do not trigger a configuration
+     * change, for example if we choose to override config change in manifest or for 180-degree
+     * orientation changes.
+     */
+    private var displayId: Int = -1
+
+    private fun updateCameraUi() {
+        // To update the SurfaceTexture, we have to remove it and re-add it
+        val parent = viewFinder.parent as ViewGroup
+        parent.removeView(viewFinder)
+        parent.addView(viewFinder, 0)
+
+    }
+
+    private var screenAspectRatio: Int = 0
     fun setScreenRatio() {
         // Get screen metrics used to setup camera for full screen resolution
         val metrics = DisplayMetrics().also { viewFinder.display.getRealMetrics(it) }
@@ -114,7 +185,7 @@ class MainActivity : AppCompatActivity(), LifecycleOwner {
         screenAspectRatio = aspectRatio(metrics.widthPixels, metrics.heightPixels)
     }
 
-    private fun aspectRatio(width: Int, height: Int): AspectRatio {
+    private fun aspectRatio(width: Int, height: Int): Int {
         val previewRatio = max(width, height).toDouble() / min(width, height)
         if (abs(previewRatio - RATIO_4_3_VALUE) <= abs(previewRatio - RATIO_16_9_VALUE)) {
             return RATIO_4_3
@@ -122,27 +193,7 @@ class MainActivity : AppCompatActivity(), LifecycleOwner {
         return RATIO_16_9
     }
 
-    private var rotation: Int = 0
-    private fun updateRotation() {
-        val matrix = Matrix()
 
-        // Compute the center of the view finder
-        val centerX = viewFinder.width / 2f
-        val centerY = viewFinder.height / 2f
-
-        // Correct preview output to account for display rotation
-        rotation = when(viewFinder.display.rotation) {
-            Surface.ROTATION_0 -> 0
-            Surface.ROTATION_90 -> 90
-            Surface.ROTATION_180 -> 180
-            Surface.ROTATION_270 -> 270
-            else -> return
-        }
-        matrix.postRotate(-rotation.toFloat(), centerX, centerY)
-
-        // Finally, apply transformations to our TextureView
-        viewFinder.setTransform(matrix)
-    }
 
     /**
      * Process result from permission request dialog box, has the request
